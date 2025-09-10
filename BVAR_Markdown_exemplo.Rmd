@@ -1,0 +1,943 @@
+---
+title: "BVAR"
+author: "Guilherme C Soares"
+date: "2025-08-25"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# 1) Pacotes e dados
+
+```{r setup}
+library(ggplot2)
+library(dplyr)
+library(tidyr)  
+library(purrr) 
+library(tibble) 
+library(knitr)  
+library(bvartools)  
+library(stringr)
+
+```
+
+```{r dataset, message=FALSE}
+
+set.seed(123)
+
+# 1) Dados
+data("us_macrodata")  # contém Dp (inflação), u (desemprego), r (Fed Funds rates)
+y <- cbind(Dp = us_macrodata[, "Dp"],
+           u  = us_macrodata[, "u"],
+           r  = us_macrodata[, "r"])  # ainda é 'ts' (mts)  :contentReference[oaicite:1]{index=1}
+
+# Estacionariza (exemplo) e define split com 'window()' para manter 'ts'
+y_diff <- diff(y)
+n_test <- 100
+Ttot   <- nrow(y_diff)
+cut_id <- Ttot - n_test              # última observação de TREINO
+
+# datas correspondentes
+t_all   <- time(y_diff)
+t_train_end <- t_all[cut_id]
+t_test_start <- t_all[cut_id + 1]
+
+y_train <- window(y_diff, end   = t_train_end)   # 'ts'
+y_test  <- window(y_diff, start = t_test_start)  # 'ts'
+
+# checagem rápida
+stopifnot(inherits(y_train, "ts"), inherits(y_test, "ts"))
+# índices na série estacionarizada
+T_total_d <- NROW(y_diff)
+stopifnot(n_test > 0, n_test < T_total_d)
+
+idx_test  <- (T_total_d - n_test + 1):T_total_d
+idx_train <- 1:(T_total_d - n_test)
+
+
+# Plot rápido das séries em nível (ou em taxa, no caso de Dp)
+autoplot_y <- function(ts_obj, title) {
+  d <- as.data.frame(ts_obj)
+  d$time <- as.numeric(time(ts_obj))
+  d <- pivot_longer(d, -time, names_to="serie", values_to="valor")
+  ggplot(d, aes(time, valor)) +
+    geom_line() +
+    facet_wrap(~ serie, scales = "free_y", ncol = 1) +
+    labs(x = NULL, y = NULL, title = title)
+}
+
+autoplot_y(y, "Séries originais (Dp, u, r)")
+```
+
+# 2) Estacionarizar e plotar
+
+Separar teste e treino:
+
+```{r plot_train_test_split, message=FALSE, warning=FALSE, fig.width=10, fig.height=12,out.width='100%'}
+
+# --- calcula ponto de corte (primeiro índice do teste) ---
+ti         <- time(y_diff)
+split_idx  <- min(idx_test)
+split_time <- ti[split_idx]
+
+# --- long data.frame para ggplot ---
+df_long <- as.data.frame(y_diff) |>
+  mutate(time = ti) |>
+  pivot_longer(-time, names_to = "var", values_to = "value")
+
+# --- plot com separação treino/teste ---
+ggplot(df_long, aes(x = time, y = value)) +
+  # sombra do TESTE (vale para todos os painéis)
+  annotate("rect",
+           xmin = split_time, xmax = Inf, ymin = -Inf, ymax = Inf,
+           fill = "grey60", alpha = 0.12) +
+  # linha de corte
+  geom_vline(xintercept = split_time, linetype = "dashed", color = "grey40") +
+  # série
+  geom_line(color = "black", linewidth = 0.3) +
+  # facetas por variável com eixos livres
+  facet_wrap(~ var, ncol = 1, scales = "free_y") +
+  labs(
+    title    = "Séries estacionarizadas (1ª diferença) — treino vs. teste",
+    subtitle = paste0("Treino: até ", sprintf("%.2f", split_time),
+                      " | Teste: últimos ", length(idx_test), " períodos"),
+    x = NULL, y = NULL,
+    caption = "Faixa sombreada = período de teste"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+------------------------------------------------------------------------
+
+# 3) Estimar BVAR(4) com diferentes priors (NW, SSVS, Minnesota)
+
+$$
+\operatorname{vec}(Y)\sim\mathcal N\!\left((I_K\otimes X)\operatorname{vec}(\mathbf B),\;\Sigma\otimes I_T\right).
+$$
+
+------------------------------------------------------------------------
+
+### MLE (Gaussian OLS)
+
+A log-verossimilhança $$
+\ell(\mathbf B,\Sigma)\propto -\tfrac{T}{2}\log|\Sigma|
+-\tfrac{1}{2}\operatorname{tr}\!\big[\Sigma^{-1}(Y-X\mathbf B)'(Y-X\mathbf B)\big].
+$$
+
+**Estimador OLS/MLE**:
+
+$$
+\boxed{\;\widehat{\mathbf B}_{\text{MLE}}=(X'X)^{-1}X'Y.\;}
+$$
+
+O MLE de $\Sigma$ é
+
+$$
+\widehat{\Sigma}_{\text{MLE}}=\frac{(Y-X\widehat{\mathbf B})'(Y-X\widehat{\mathbf B})}{T}\quad
+$$
+
+(ou com algum ajuste em T pra var.)
+
+------------------------------------------------------------------------
+
+### Prior conjugado **Matrix-Normal + Inverse-Wishart** (Normal–Wishart)
+
+### Versão por equação
+
+Para a $k$-ésima equação $y_k = X\beta_k + \varepsilon_k$, com $\varepsilon_k\sim\mathcal N(0,\sigma_k^2 I)$, um prior conjugado escalar:
+
+$$ \beta_k\,|\,\sigma_k^2 \sim \mathcal N(\beta_{0k},\,\sigma_k^2 V_0),\qquad \sigma_k^2 \sim \mathcal{IG}\!\left(\tfrac{\nu_0}{2},\,\tfrac{s_0}{2}\right). $$
+
+Então
+
+$$ V_{n}=(V_0^{-1}+X'X)^{-1},\qquad \beta_{nk}=V_n\left(V_0^{-1}\beta_{0k}+X'y_k\right), $$
+
+e, no limite a **prior flat** para $V_0^{-1}\to 0$, temos a posterior $\beta_{nk}\to(X'X)^{-1}X'y_k$ (**OLS/MLE**).
+
+> **Como a prior afeta a posterior (para** $\mathbf B$) A média posterior $\mathbf B_n$ é uma **média ponderada** entre a informação amostral $X'Y$ e a prior $V_0^{-1}\mathbf B_0$, com precisão total $V_0^{-1}+X'X$. Quando $V_0$ é pequeno (grande $V_0^{-1}$), há **maior shrinkage** em direção a $\mathbf B_0$ (para shrinkage em geral hyperprior=zero). Quando $V_0$ é grande (pequeno $V_0^{-1}$), a prior pesa pouco e a posterior se aproxima do MLE.
+
+$$
+V_0^{-1}\to 0 \quad (\text{variância prior } V_0 \text{ muito grande})
+$$
+
+temos,
+
+$$
+V_n \to (X'X)^{-1},\qquad
+\mathbf B_n \to (X'X)^{-1}X'Y = \widehat{\mathbf B}_{\text{MLE}}.
+$$
+
+------------------------------------------------------------------------
+
+# Quais priors vamos usar?
+
+### Minnesota
+
+Prior normal independente por coeficiente, com média típica $m_{ij\ell}$ (geralmente $m_{ii1}=1$ se a variável está em nível; caso contrário $0$) e variâncias que decaem com o lag e diferenciam “própria variável” vs. “cruzada”:
+
+$$
+b_{ij\ell}\;\sim\;\mathcal N\!\big(m_{ij\ell},\,\lambda_{ij\ell}\big),\qquad
+\lambda_{ij\ell}
+= \frac{\kappa_1}{\ell^{\kappa_3}}\times
+\begin{cases}
+\dfrac{\sigma_i^2}{\sigma_j^2}, & i=j,\\[6pt]
+\kappa_2\,\dfrac{\sigma_i^2}{\sigma_j^2}, & i\neq j~,
+\end{cases}
+$$
+
+onde $\kappa_1$ controla o encolhimento geral, $\kappa_2$ o encolhimento de coeficientes cruzados e $\kappa_3$ o decaimento com o lag $\ell$.
+
+### Inverse–Wishart
+
+A matriz de erros do VAR recebe uma prior conjugada do tipo Inverse–Wishart:
+
+$$
+\Sigma \;\sim\; \mathcal{IW}(S_0,\nu_0),
+$$
+
+com hiperparâmetros $S_0$ (matriz escala) e $\nu_0$ (graus de liberdade). Em esquemas conjugados usuais, os coeficientes seguem uma **Matrix–Normal** condicionalmente a $\Sigma$.
+
+### SSVS
+
+Prior de mistura *spike-and-slab* coeficiente a coeficiente: um indicador de inclusão escolhe entre variância “pequena” (spike) e “grande” (slab):
+
+$$
+\beta_k \,\big|\, \gamma_k \;\sim\; \mathcal N\!\big(0,\; \tau_{\gamma_k}^2\big),
+\qquad
+\gamma_k \sim \text{Bernoulli}(\pi),\qquad
+\tau_{\gamma_k}^2=
+\begin{cases}
+\tau_0^2,& \gamma_k=0 \ (\text{spike}),\\
+\tau_1^2,& \gamma_k=1 \ (\text{slab}),
+\end{cases}
+\quad \text{com } \tau_0^2 \ll \tau_1^2.
+$$
+
+```{r estimate_bvar, message=FALSE}
+
+set.seed(123)
+
+# Especificações MCMC
+p_lags <- 4
+iters  <- 2000
+burnin <- 2000
+
+# Base do modelo
+base <- gen_var(y_train, p = p_lags, deterministic = "const",
+                iterations = iters, burnin = burnin)
+
+# Priors Normal–Wishart com variâncias alvo: 1, 0.5, 0.25
+# Atenção: v_i = 1/variância
+K <- ncol(y_train)
+priors <- list(
+  NW_var1    = add_priors(base,
+                          coef  = list(v_i = 1,    v_i_det = 1),
+                          sigma = list(df = K, scale = 0.0001)),
+  NW_var0.5  = add_priors(base,
+                          coef  = list(v_i = 2,    v_i_det = 2),
+                          sigma = list(df = K, scale = 0.0001)),
+  NW_var0.25 = add_priors(base,
+                          coef  = list(v_i = 4,    v_i_det = 4),
+                          sigma = list(df = K, scale = 0.0001))
+)
+
+# Prior SSVS (ajuste hiperparâmetros conforme preferência)
+priors$SSVS03 <- add_priors(
+  base,
+  ssvs  = list(inprior = 0.3, tau = c(0.1, 10), covar = FALSE, exclude_det = TRUE),
+  sigma = list(df = K, scale = 0.0001)
+)
+priors$SSVS05 <- add_priors(
+  base,
+  ssvs  = list(inprior = 0.5, tau = c(0.1, 10), covar = FALSE, exclude_det = TRUE),
+  sigma = list(df = K, scale = 0.0001)
+)
+priors$SSVS08 <- add_priors(
+  base,
+  ssvs  = list(inprior = 0.8, tau = c(0.1, 10), covar = FALSE, exclude_det = TRUE),
+  sigma = list(df = K, scale = 0.0001)
+)
+
+# Prior Minnesota (valores padrão razoáveis)
+priors$Minn10 <- add_priors(
+  base,
+  coef  = list(minnesota = list(kappa0 = 1, kappa1 = 1, kappa2 = NULL, kappa3 = 2)),
+  sigma = list(df = K, scale = 0.0001)
+)
+
+priors$Minn05 <- add_priors(
+  base,
+  coef  = list(minnesota = list(kappa0 = 0.5, kappa1 = 0.5, kappa2 = NULL, kappa3 = 2)),
+  sigma = list(df = K, scale = 0.0001)
+)
+
+priors$Minn02 <- add_priors(
+  base,
+  coef  = list(minnesota = list(kappa0 = 0.2, kappa1 = 0.2, kappa2 = NULL, kappa3 = 2)),
+  sigma = list(df = K, scale = 0.0001)
+)
+
+priors$Minn01 <- add_priors(
+  base,
+  coef  = list(minnesota = list(kappa0 = 0.1, kappa1 = 0.1, kappa2 = NULL, kappa3 = 2)),
+  sigma = list(df = K, scale = 0.0001)
+)
+
+# Estima todos
+mods <- lapply(priors, draw_posterior)  # cada elemento vira um "bvar"
+names(mods) <- names(priors)
+# opcional: para usar summary(mods) como bvarlist
+class(mods) <- c("bvarlist", "list")
+
+names(mods)
+```
+
+Referências das funções usadas: `gen_var`, `add_priors`, `draw_posterior`, Minnesota e SSVS.
+
+------------------------------------------------------------------------
+
+# 4) Tabela com posteriores (betas) e histograma de densidades
+
+> `summary(bvar)` retorna estatísticas das posteriores (pós burn-in). Vamos juntar tudo numa tabela e também fazer um **histplot** sobrepondo as densidades de um beta escolhido em cada modelo.
+
+```{r posterior_table, message=FALSE}
+# ---- alvo: coeficientes de u defasada (L1..L4) na equação de u ----
+eq_label  <- "u"   # equação alvo
+var_label <- "u"   # regressora alvo
+max_lag   <- 4     # quantos lags listar
+
+# ---- helpers robustos ----
+posterior_stats <- function(x) {
+  tibble::tibble(
+    Mean   = mean(x),
+    SD     = sd(x),
+    `2.5%` = stats::quantile(x, 0.025),
+    `50%`  = stats::quantile(x, 0.50),
+    `97.5%`= stats::quantile(x, 0.975)
+  )
+}
+
+infer_dims <- function(obj){
+  A <- as.matrix(obj$A)
+  if (is.null(dim(A))) stop("Este 'bvar' não contém draws de A (A sem dimensão).")
+  S <- nrow(A); Pdim <- ncol(A)
+
+  # tenta inferir K por Sigma ou C
+  K <- NA_integer_
+  if (!is.null(obj$Sigma)) {
+    Sig <- as.matrix(obj$Sigma)
+    if (!is.null(dim(Sig))) {
+      k2 <- ncol(Sig)
+      Kc <- as.integer(round(sqrt(k2)))
+      if (Kc^2 == k2) K <- Kc
+    }
+  }
+  if (is.na(K) && !is.null(obj$C)) {
+    C <- as.matrix(obj$C)
+    if (!is.null(dim(C))) K <- ncol(C)
+  }
+  if (is.na(K) || K <= 0) stop("Não foi possível inferir K (Sigma/C ausentes).")
+  if ((Pdim %% (K*K)) != 0) stop(sprintf("ncol(A)=%d não é múltiplo de K^2=%d.", Pdim, K*K))
+
+  p <- as.integer(Pdim/(K*K))
+  vars <- colnames(obj$Y); if (is.null(vars)) vars <- colnames(obj$y)
+  if (is.null(vars)) vars <- paste0("y", seq_len(K))
+  list(K=K, p=p, vars=vars, S=S, A=A)
+}
+
+match_var <- function(label, vars){
+  idx <- match(label, vars)
+  if (is.na(idx)) idx <- match(tolower(label), tolower(vars))
+  idx
+}
+
+get_draws_idx <- function(obj, eq_idx, reg_var_idx, L){
+  d <- infer_dims(obj); K <- d$K; p <- d$p; A <- d$A; Kp <- K*p
+  if (L < 1 || L > p) stop(sprintf("Lag %d fora de 1..%d.", L, p))
+  col_idx <- (eq_idx - 1L)*Kp + (L - 1L)*K + reg_var_idx
+  as.numeric(A[, col_idx])
+}
+
+# ---- escolhe modelo de referência válido para obter p/vars ----
+ref <- NULL
+for (nm in names(mods)) {
+  tmp <- try(infer_dims(mods[[nm]]), silent = TRUE)
+  if (!inherits(tmp, "try-error")) { ref <- tmp; break }
+}
+if (is.null(ref)) stop("Nenhum modelo válido em 'mods' (sem draws de A).")
+
+p_all <- ref$p
+vars  <- ref$vars
+Ls    <- seq_len(min(max_lag, p_all))
+
+# ---- coleta estatísticas por modelo e por lag ----
+stats_long <- purrr::imap_dfr(mods, function(m, nm){
+  dm <- try(infer_dims(m), silent = TRUE)
+  if (inherits(dm, "try-error")) return(NULL)  # pula modelos problemáticos
+  eq_i  <- match_var(eq_label,  dm$vars)
+  reg_j <- match_var(var_label, dm$vars)
+  if (is.na(eq_i) || is.na(reg_j)) return(NULL)
+
+  dplyr::bind_rows(lapply(Ls, function(L){
+    draws <- get_draws_idx(m, eq_i, reg_j, L)
+    posterior_stats(draws) |>
+      dplyr::mutate(model = nm, lag = paste0("L", L), .before = 1)
+  }))
+})
+
+# versão longa (uma linha por modelo×lag)
+stats_long <- stats_long |>
+  dplyr::arrange(lag, model)
+
+# versão wide (cada lag vira um bloco de colunas)
+stats_wide <- stats_long |>
+  dplyr::select(model, lag, Mean, SD, `2.5%`, `50%`, `97.5%`) |>
+  tidyr::pivot_wider(
+    names_from  = lag,
+    values_from = c(Mean, SD, `2.5%`, `50%`, `97.5%`),
+    names_glue  = "{.value}_{lag}"
+  ) |>
+  dplyr::arrange(model) |>
+  dplyr::mutate(dplyr::across(-model, ~round(., 4)))
+
+# se você tiver 'model_levels', força a ordem padrão dos modelos
+if (exists("model_levels")) {
+  stats_wide <- stats_wide |>
+    dplyr::mutate(model = factor(model, levels = model_levels)) |>
+    dplyr::arrange(model) |>
+    dplyr::mutate(model = as.character(model))
+}
+
+stats_wide
+
+
+
+```
+
+```{r col_palete}
+# --- níveis na ordem que deseja aparecer (usa a ordem da lista 'mods') ---
+model_levels <- names(mods)
+
+# --- ajuda pra extrair o número de cada família ---
+num_or_na <- function(x) suppressWarnings(as.numeric(x))
+
+# Separa modelos por família
+nw   <- model_levels[grepl("^NW_",   model_levels)]
+ssvs <- model_levels[grepl("^SSVS",  model_levels, ignore.case = FALSE)]
+minn <- model_levels[grepl("^Minn",  model_levels, ignore.case = FALSE)]
+
+# Extrai "variância" (ou proxy) de cada família para ordenar do MAIOR -> MENOR
+# NW_varX: usamos o próprio X como variância alvo
+nw_val <- num_or_na(sub("^NW_var", "", nw))
+
+# SSVSxx: usamos a prob. de inclusão (ex.: 03 -> 0.3); menor = mais shrink
+ssvs_val <- num_or_na(sub("^SSVS", "", ssvs)) / 100
+
+# MinnXX: usamos kappa (ex.: 01 -> 0.1); menor = mais shrink
+minn_val <- num_or_na(sub("^Minn", "", minn)) / 100
+
+# Paletas (claro -> escuro); depois vamos REVERTER pra dar mais escuro ao menor valor
+pal_blue  <- colorRampPalette(c("#daebf9", "#9ecae1", "#3182bd", "#08306b"))
+pal_green <- colorRampPalette(c("#d9f1d9", "#a1d99b", "#31a354", "#005a32"))
+pal_red   <- colorRampPalette(c("#fed6d9", "#fcae99", "#fb6a4a", "#cb181d", "#99000d"))
+
+model_cols <- setNames(rep("#999999", length(model_levels)), model_levels)  # default
+
+# --- NW: menor variância -> mais ESCURO ---
+if (length(nw)) {
+  ord_nw <- order(nw_val, decreasing = FALSE)                # menor -> primeiro
+  cols_nw <- rev(pal_blue(length(nw)))                       # reverte: escuro para menores
+  model_cols[nw[ord_nw]] <- cols_nw
+}
+
+# --- SSVS: menor inprior -> mais shrink -> mais ESCURO ---
+if (length(ssvs)) {
+  ord_ss <- order(ssvs_val, decreasing = FALSE)
+  cols_ss <- rev(pal_green(length(ssvs)))
+  model_cols[ssvs[ord_ss]] <- cols_ss
+}
+
+# --- Minnesota: menor kappa -> mais shrink -> mais ESCURO ---
+if (length(minn)) {
+  ord_mn <- order(minn_val, decreasing = FALSE)
+  cols_mn <- rev(pal_red(length(minn)))
+  model_cols[minn[ord_mn]] <- cols_mn
+}
+
+
+# --- Use assim em QUALQUER ggplot em que você tenha
+```
+
+```{r posterior_density_grid, fig.width=18, fig.height=10, out.width='100%', fig.align='center', dev='svg',message=FALSE, warning=FALSE}
+
+
+# >>> usa a paleta definida anteriormente
+stopifnot(exists("model_cols"), exists("model_levels"))
+
+# ---------- helpers ----------
+infer_dims <- function(obj){
+  A <- as.matrix(obj$A); S <- nrow(A); Pdim <- ncol(A)
+  K <- NULL
+  if (!is.null(obj$Sigma)) {
+    k2 <- ncol(as.matrix(obj$Sigma)); Kc <- as.integer(round(sqrt(k2)))
+    if (Kc^2 == k2) K <- Kc
+  }
+  if (is.null(K) && !is.null(obj$C)) K <- ncol(as.matrix(obj$C))
+  if (is.null(K)) stop("Não foi possível inferir K.")
+  if (Pdim %% (K*K) != 0) stop("Dimensões de A incompatíveis com K.")
+  p <- as.integer(Pdim/(K*K))
+  vars <- colnames(obj$Y); if (is.null(vars)) vars <- colnames(obj$y)
+  if (is.null(vars)) vars <- paste0("y", seq_len(K))
+  list(K=K, p=p, vars=vars, S=S, A=A)
+}
+match_var <- function(label, vars){
+  idx <- match(label, vars)
+  if (is.na(idx)) idx <- match(tolower(label), tolower(vars))
+  idx
+}
+get_draws_idx <- function(obj, eq_idx, reg_var_idx, L){
+  d <- infer_dims(obj); K <- d$K; p <- d$p; A <- d$A; Kp <- K*p
+  if (L < 1 || L > p) stop(sprintf("Lag %d fora de 1..%d.", L, p))
+  col_idx <- (eq_idx - 1L)*Kp + (L - 1L)*K + reg_var_idx
+  as.numeric(A[, col_idx])
+}
+
+# ---------- constrói DF de densidades para uma equação ----------
+build_dens_df <- function(eq_target, mods){
+  # referencial (pega o 1º modelo válido)
+  ref <- NULL
+  for (nm in names(mods)) {
+    try({ ref <- infer_dims(mods[[nm]]); break }, silent = TRUE)
+  }
+  if (is.null(ref)) stop("Nenhum modelo válido em 'mods'.")
+  K <- ref$K; p <- ref$p; vars <- ref$vars
+
+  eq_idx <- match_var(eq_target, vars)
+  if (is.na(eq_idx)) stop(sprintf("Equação '%s' não encontrada. Opções: %s",
+                                  eq_target, paste(vars, collapse=", ")))
+
+  rows <- list(); skipped <- character()
+  for (nm in names(mods)) {
+    res <- try({
+      dm <- infer_dims(mods[[nm]])
+      if (dm$K != K || dm$p != p) stop("Dimensões diferentes do modelo de referência.")
+      bind_rows(lapply(seq_len(K), function(vj){
+        bind_rows(lapply(seq_len(p), function(L){
+          tibble(
+            valor   = get_draws_idx(mods[[nm]], eq_idx, vj, L),
+            modelo  = nm,
+            reg_var = vars[vj],
+            L       = L
+          )
+        }))
+      }))
+    }, silent = TRUE)
+    if (inherits(res, "try-error")) {
+      skipped <- c(skipped, nm)
+    } else {
+      rows[[nm]] <- res
+    }
+  }
+
+  out <- bind_rows(rows)
+  # >>> níveis/ordem iguais aos dos gráficos (usa model_levels)
+  out$modelo <- factor(out$modelo, levels = model_levels)
+  attr(out, "vars")    <- vars
+  attr(out, "p")       <- p
+  attr(out, "skipped") <- skipped
+  out
+}
+
+# ---------- plota 3x4 para UMA equação (linhas = regressoras, colunas = lags) ----------
+plot_eq_grid <- function(eq_label){
+  dd <- build_dens_df(eq_label, mods)
+  vars <- attr(dd, "vars"); p <- attr(dd, "p")
+
+  dd <- dd %>%
+    mutate(
+      reg_var = factor(reg_var, levels = vars),
+      lag     = factor(L, levels = 1:p, labels = paste0("L", 1:p))
+    )
+
+  ggplot(dd, aes(x = valor, color = modelo, fill = modelo)) +
+    geom_density(aes(y = after_stat(scaled)), alpha = 0.20, adjust = 1) +
+    facet_wrap(~ reg_var + lag, scales = "free", nrow = 3, ncol = 4) +
+    labs(
+      y = "densidade (normalizada: máx = 1)",
+      x = paste0(eq_label, " ~ regressor defasado"),
+      title = paste0("Posteriores dos coeficientes (BETAS) por equação: ", eq_label)
+    ) +
+    # >>> aplica a paleta definida anteriormente
+    scale_color_manual(values = model_cols, limits = model_levels, drop = FALSE, name = NULL) +
+    scale_fill_manual(values  = model_cols, limits = model_levels, drop = FALSE, name = NULL) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+# ---------- gera os 3 gráficos (um por equação) ----------
+eqs <- infer_dims(mods[[1]])$vars  # ex.: c("Dp","u","r")
+plots <- lapply(eqs, plot_eq_grid)
+for (p in plots) print(p)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 5) Previsão (rolling one-step) e métricas: RMSE, MAE e log predictive density
+
+**ariância preditiva marginal** no horizonte $h$ vem da diagonal de
+
+$$
+\Sigma_h \;=\; \sum_{i=0}^{h-1}\Psi_i\,\Sigma\,\Psi_i', 
+\qquad \text{logo}\quad \sigma^2_{h,j}=\big[\Sigma_h\big]_{jj}.
+$$
+
+------------------------------------------------------------------------
+
+### RMSE (Root Mean Squared Error)
+
+$$
+\boxed{\;
+\operatorname{RMSE}_j(h)\;=\;\sqrt{\frac{1}{O}\sum_{o=1}^{O} e_{o,h,\,j}^{\,2}}
+\;}
+$$
+
+### MAE (Mean Absolute Error)
+
+$$
+\boxed{\;
+\operatorname{MAE}_j(h)\;=\;\frac{1}{O}\sum_{o=1}^{O} \big|e_{o,h,\,j}\big|
+\;}
+$$
+
+### LPD (Log Predictive Density, marginal por variável)
+
+Assumindo previsão **Normal marginal** para $y_{o+h-1,\,j}$ com média $\hat y_{o,h,\,j}$ e variância $\sigma^2_{h,j}$,
+
+$$
+\boxed{\;
+\operatorname{LPD}_j(h)\;=\;\frac{1}{O}\sum_{o=1}^{O}
+\log\!\Big[\mathcal N\!\big(y_{o+h-1,\,j}\,\big|\,\hat y_{o,h,\,j},\,\sigma^2_{h,j}\big)\Big]
+\;=\;-\tfrac{1}{2}\log(2\pi\sigma^2_{h,j})-\frac{1}{2O}\sum_{o=1}^{O}\frac{e_{o,h,\,j}^{\,2}}{\sigma^2_{h,j}}
+\;}
+$$
+
+```{r notation_table, results='asis'}
+
+tab <- tribble(
+  ~`Símbolo`, ~Descrição,
+  "$h$", "Horizonte de previsão (passos à frente).",
+  "$H$", "Horizonte máximo avaliado.",
+  "$o$", "Índice da origem de previsão.",
+  "$O$", "Número total de origens de previsão consideradas.",
+  "$j$", "Índice da variável no vetor do VAR.",
+  "$K$", "Número de variáveis do VAR.",
+  "$t$", "Índice temporal na amostra.",
+  "$p$", "Ordem do VAR (número de defasagens).",
+  "$y_{o+h-1,\\,j}$", "Valor observado da variável $j$ no passo $h$ a partir da origem $o$.",
+  "$\\hat y_{o,h,\\,j}$", "Previsão (média preditiva) da variável $j$ no horizonte $h$ a partir da origem $o$.",
+  "$e_{o,h,\\,j}=y_{o+h-1,\\,j}-\\hat y_{o,h,\\,j}$", "Erro de previsão da variável $j$ no horizonte $h$ e origem $o$."
+)
+
+if (requireNamespace("kableExtra", quietly = TRUE)) {
+  kable(
+    tab,
+    format   = ifelse(knitr::is_latex_output(), "latex", "html"),
+    booktabs = TRUE, escape = FALSE,
+    caption  = "Notação e índices usados nas métricas."
+  ) |>
+    kableExtra::kable_styling(full_width = FALSE, position = "left")
+} else {
+  # fallback sem kableExtra
+  kable(
+    tab,
+    format   = ifelse(knitr::is_latex_output(), "latex", "html"),
+    booktabs = knitr::is_latex_output(),
+    escape   = FALSE,
+    caption  = "Notação e índices usados nas métricas."
+  )
+}
+
+```
+
+```{r forecast_metrics, message=FALSE}
+
+# --- helpers (usando seus objetos 'mods', 'y_diff', 'idx_test') ---
+infer_params <- function(obj){
+  A <- as.matrix(obj$A); S <- nrow(A); Pdim <- ncol(A)
+  Sig <- as.matrix(obj$Sigma); K <- NULL
+  if (!is.null(Sig)) { k2 <- ncol(Sig); Kc <- as.integer(round(sqrt(k2))); if (Kc^2 == k2) K <- Kc }
+  if (is.null(K) && !is.null(obj$C)) K <- ncol(as.matrix(obj$C))
+  stopifnot(!is.null(K), Pdim %% (K*K) == 0)
+  p <- as.integer(Pdim/(K*K))
+  C <- if (!is.null(obj$C)) as.matrix(obj$C) else matrix(0, nrow=S, ncol=K)
+  list(K=K, p=p, S=S, A=A, C=C, Sigma=Sig)
+}
+
+posterior_means_ACSigma <- function(obj){
+  ip <- infer_params(obj); K <- ip$K; p <- ip$p; S <- ip$S
+  # A_bar
+  A_bar <- array(0, dim=c(K,K,p))
+  for (s in 1:S){
+    A_s <- matrix(ip$A[s,], nrow=K, byrow=TRUE)
+    for (L in 1:p) A_bar[,,L] <- A_bar[,,L] + A_s[, ((L-1)*K+1):(L*K), drop=FALSE]
+  }
+  A_bar <- A_bar / S
+  # C_bar
+  C_bar <- colMeans(ip$C)
+  # Sigma_bar
+  Sig_bar <- matrix(colMeans(ip$Sigma), nrow=K, byrow=TRUE)
+  list(A_bar=A_bar, C_bar=C_bar, Sigma_bar=Sig_bar, K=K, p=p)
+}
+
+# MA coeficientes Psi_i até H-1 (Ψ_0=I, Ψ_i = sum_{l=1..p} A_l Ψ_{i-l})
+psi_list <- function(A_bar, H){
+  K <- dim(A_bar)[1]; p <- dim(A_bar)[3]
+  Psi <- vector("list", H); Psi[[1]] <- diag(K) # Ψ_0
+  for (h in 2:H){
+    acc <- matrix(0, K, K)
+    for (l in 1:min(p, h-1)) acc <- acc + A_bar[,,l] %*% Psi[[h-l]]
+    Psi[[h]] <- acc
+  }
+  Psi
+}
+
+# previsão dinâmica H-passos com A_bar/C_bar
+forecast_path_mean <- function(A_bar, C_bar, Y, t0, H){
+  K <- ncol(Y); p <- dim(A_bar)[3]
+  L <- matrix(NA_real_, nrow=p, ncol=K); for (ell in 1:p) L[ell,] <- Y[t0-ell,]
+  Yhat <- matrix(NA_real_, nrow=H, ncol=K)
+  for (h in 1:H){
+    y_new <- C_bar
+    for (LAG in 1:p) y_new <- y_new + drop(A_bar[,,LAG] %*% L[LAG,])
+    y_new <- as.numeric(y_new)
+    Yhat[h,] <- y_new
+    if (p>1) L <- rbind(matrix(y_new,1), L[1:(p-1),,drop=FALSE]) else L[1,] <- y_new
+  }
+  Yhat
+}
+
+metrics_by_h <- function(obj, y_all, idx_test, H=8){
+  pm <- posterior_means_ACSigma(obj)
+  A_bar <- pm$A_bar; C_bar <- pm$C_bar; Sig_bar <- pm$Sigma_bar
+  K <- pm$K; p <- pm$p; Y <- as.matrix(y_all); Tn <- nrow(Y)
+  # Índices válidos
+  idx <- if (is.ts(y_all)) {
+    pos <- seq_len(Tn); names(pos) <- as.character(time(y_all))
+    ii <- if (is.numeric(idx_test)) idx_test else match(idx_test, names(pos)); as.integer(ii)
+  } else as.integer(idx_test)
+  idx <- idx[!is.na(idx) & idx>p & (idx+H-1)<=Tn]
+  stopifnot(length(idx)>0)
+
+  # Prepara Ψ e Σ_h = sum_{i=0..h-1} Ψ_i Σ Ψ_i'
+  Psis <- psi_list(A_bar, H)
+  Sigma_h <- lapply(1:H, function(h){
+    Sacc <- matrix(0, K, K)
+    for (i in 1:h) Sacc <- Sacc + Psis[[i]] %*% Sig_bar %*% t(Psis[[i]])
+    Sacc
+  })
+
+  err2 <- lapply(1:H, function(...) matrix(0.0, nrow=length(idx), ncol=K))
+  absE <- lapply(1:H, function(...) matrix(0.0, nrow=length(idx), ncol=K))
+  lpdf <- lapply(1:H, function(...) matrix(0.0, nrow=length(idx), ncol=K))
+
+  for (o in seq_along(idx)){
+    t0 <- idx[o]
+    Yhat <- forecast_path_mean(A_bar, C_bar, Y, t0, H) # H x K
+    for (h in 1:H){
+      y_true <- Y[t0+h-1,]
+      e      <- y_true - Yhat[h,]
+      err2[[h]][o,] <- e^2
+      absE[[h]][o,] <- abs(e)
+      sdv <- sqrt(pmax(diag(Sigma_h[[h]]), .Machine$double.eps))
+      lpdf[[h]][o,] <- dnorm(y_true, mean=Yhat[h,], sd=sdv, log=TRUE)
+    }
+  }
+
+  cn <- colnames(Y); if (is.null(cn)) cn <- paste0("y", seq_len(K))
+  bind_rows(lapply(1:H, function(h){
+    tibble(
+      horizon = h,
+      var     = cn,
+      RMSE    = sqrt(colMeans(err2[[h]])),
+      MAE     = colMeans(absE[[h]]),
+      LPD     = colMeans(lpdf[[h]])   # LPD marginal (por variável) médio nas origens
+    )
+  }))
+}
+
+# ---- roda para todos os modelos, H=8 ----
+H <- 4
+metrics_h <- purrr::imap_dfr(
+  mods, ~ metrics_by_h(.x, y_diff, idx_test, H) %>% mutate(model = .y)
+) %>% dplyr::relocate(model, var, horizon)
+
+metrics_h
+
+
+```
+
+```{r bar_grid_metrics, message=FALSE, warning=FALSE,fig.width=15, fig.height=25, out.width='100%', dev='svg'}
+
+# usa a paleta definida anteriormente
+stopifnot(exists("model_cols"), exists("model_levels"))
+
+stopifnot(all(c("model","var","horizon","RMSE","MAE","LPD") %in% names(metrics_h)))
+
+var_levels <- unique(metrics_h$var)
+Hmax <- max(metrics_h$horizon, na.rm = TRUE)
+
+metrics_h_long <- metrics_h %>%
+  pivot_longer(c(RMSE, MAE, LPD), names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric    = factor(metric, levels = c("RMSE","MAE","LPD")),
+    var       = factor(var, levels = var_levels),
+    # >>> força os níveis/ordem dos modelos para bater com a paleta
+    model     = factor(model, levels = model_levels),
+    horizon_f = factor(horizon, levels = seq_len(Hmax), labels = paste0("h", seq_len(Hmax))),
+    facet_id  = paste0(as.character(metric), " · ", as.character(var)),
+    label     = ifelse(metric == "LPD", sprintf("%.2f", value), sprintf("%.3f", value)),
+    vjust_lab = ifelse(value < 0, 1.2, -0.25)
+  ) %>%
+  group_by(facet_id) %>%                    # mesma escala por LINHA (todas as colunas)
+  mutate(
+    y_min_row = min(value, na.rm = TRUE) - 0.05,
+    y_max_row = max(value, na.rm = TRUE) + 0.05
+  ) %>%
+  ungroup()
+
+# ---- controles visuais ----
+bar_lwd <- 4      # espessura da “barra” (segmento)
+gap     <- 1.30   # >1 aumenta o espaço entre modelos
+
+# posição X por modelo (constante em todas as colunas)
+M <- nlevels(metrics_h_long$model)
+metrics_h_long <- metrics_h_long %>%
+  mutate(x_m = as.integer(model) * gap)
+x_breaks <- gap * seq_len(M)
+x_labels <- levels(metrics_h_long$model)
+
+# ordem das 9 linhas: 3 RMSE, 3 MAE, 3 LPD
+facet_levels <- c(paste0("RMSE · ", var_levels),
+                  paste0("MAE · " , var_levels),
+                  paste0("LPD · " , var_levels))
+metrics_h_long$facet_id <- factor(metrics_h_long$facet_id, levels = facet_levels)
+
+ggplot(metrics_h_long, aes(x = x_m, y = value, color = model)) +
+  geom_segment(aes(xend = x_m, y = y_min_row, yend = value),
+               linewidth = bar_lwd, lineend = "butt") +
+  geom_point(size = 2) +
+  geom_text(aes(label = label, vjust = vjust_lab), color = "black", size = 4) +
+  geom_blank(aes(y = y_min_row)) +         # fixa limites da linha
+  geom_blank(aes(y = y_max_row)) +
+  facet_grid(facet_id ~ horizon_f, scales = "free_y") +   # 9 linhas x 8 colunas
+  scale_x_continuous(
+    breaks = x_breaks,
+    labels = x_labels,
+    expand = expansion(add = c(gap*0.6, gap*0.6))
+  ) +
+  # >>> aplica a paleta customizada (cores por modelo)
+  scale_color_manual(values = model_cols, limits = model_levels, drop = FALSE, name = NULL) +
+  scale_fill_manual(values  = model_cols, limits = model_levels, drop = FALSE, name = NULL) +
+  labs(
+    x = "Modelos (em cada horizonte)", y = NULL,
+    title = "RMSE, MAE e LPD — 9 linhas × 8 colunas",
+    subtitle = "Colunas = horizontes; mesma escala Y por linha; paleta NW=azuis, SSVS=verdes, Minn=vermelhos"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    strip.text.y.left = element_text(angle = 0)
+  )
+
+```
+
+```{r bar_3panels_means_over_horizons, message=FALSE, warning=FALSE,fig.width=16, fig.height=6, out.width='100%', dev='svg'}
+
+
+# precisa da paleta definida antes
+stopifnot(exists("model_cols"), exists("model_levels"))
+stopifnot(all(c("model","var","horizon","RMSE","MAE","LPD") %in% names(metrics_h)))
+
+# helpers p/ ordenar dentro de cada facet
+reorder_within <- function(x, by, within, fun = mean, sep = "___") {
+  x_within <- paste(x, within, sep = sep)
+  stats::reorder(x_within, by, FUN = fun)
+}
+scale_x_reordered <- function(..., sep = "___") {
+  scale_x_discrete(labels = function(x) gsub(paste0(sep, ".*$"), "", x), ...)
+}
+
+# média sobre variáveis e horizontes
+metrics_mean <- metrics_h %>%
+  group_by(model) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE  = mean(MAE,  na.rm = TRUE),
+    LPD  = mean(LPD,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(c(RMSE, MAE, LPD), names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric    = factor(metric, levels = c("RMSE","MAE","LPD")),
+    # força níveis dos modelos para casar com a paleta
+    model     = factor(model, levels = model_levels),
+    label     = ifelse(metric == "LPD", sprintf("%.2f", value), sprintf("%.3f", value)),
+    vjust_lab = ifelse(value < 0, 1.2, -0.25),
+    model_ord = reorder_within(model, value, metric)
+  ) %>%
+  group_by(metric) %>%
+  mutate(
+    y0     = min(value, na.rm = TRUE) - 0.05,
+    mid    = (value + y0) / 2,
+    height = pmax(abs(value - y0), .Machine$double.eps)
+  ) %>%
+  ungroup()
+
+ggplot(metrics_mean, aes(x = model_ord, fill = model)) +
+  geom_tile(aes(y = mid, height = height), width = 0.7) +
+  geom_text(aes(y = value, label = label, vjust = vjust_lab), color = "black", size = 3) +
+  facet_wrap(~ metric, scales = "free", nrow = 1) +
+  scale_x_reordered() +
+  # aplica a paleta
+  scale_fill_manual(values = model_cols, limits = model_levels, drop = FALSE, name = NULL) +
+  labs(
+    x = NULL, y = NULL,
+    title = "Média das métricas por modelo",
+    subtitle = "RMSE, MAE e LPD (cores conforme famílias/prior)"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+------------------------------------------------------------------------
+
+# 6) IRF de unemployment → inflation (subplots por modelo)
+
+```{r irf_plots, message=FALSE, fig.width=10, fig.height=10, out.width='100%', dev='svg'}
+par(mfrow = c(4, 4), mar = c(3,3,2,1))
+nh <- 12  # horizonte
+
+plot_irf_one <- function(obj, title) {
+  ir <- irf(obj, impulse = "u", response = "Dp", n.ahead = nh, type = "gir")
+  plot(ir, main = title)
+}
+
+model_names <- names(mods)
+for (nm in model_names) {
+  plot_irf_one(mods[[nm]], nm)
+}
+# Se sobrar um painel, deixe em branco
+```
