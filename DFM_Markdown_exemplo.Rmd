@@ -1,0 +1,517 @@
+---
+title: "DFM"
+author: "Guilherme C Soares"
+date: "2025-08-19"
+output: html_document
+---
+
+# Pacotes e etc.
+
+```{r setup, message=TRUE, warning=FALSE}
+# 0) Setup ----
+set.seed(123)
+if (!requireNamespace('remotes', quietly=TRUE)) install.packages('remotes')
+remotes::install_github('srlanalytics/bdfm')
+# Pacotes usados
+pkgs <- c("ggplot2", "MASS", "vars")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Tenta carregar bdfm (CRAN); se não houver, exibe instrução p/ GitHub
+if (!requireNamespace("bdfm", quietly = TRUE)) {
+  message("Pacote 'bdfm' não encontrado no CRAN. ",
+          "Se você tiver o repo GitHub do bdfm, rode algo como:\n",
+          "  if (!requireNamespace('remotes', quietly=TRUE)) install.packages('remotes')\n",
+          "  remotes::install_github('srlanalytics/bdfm')\n",
+          "Depois, reinicie e rode novamente.")
+} else {
+  library(bdfm)
+}
+
+# Funções auxiliares: Procrustes (rotação ortogonal) e alinhamento de loadings
+align_factors <- function(F_est, F_true) {
+  # F_est, F_true: T x r (linhas = tempo; colunas = fatores)
+  H <- t(F_est) %*% F_true
+  sv <- svd(H)
+  R <- sv$u %*% t(sv$v)                    # rotação ortogonal r x r
+  list(F_est_rot = F_est %*% R, R = R)
+}
+align_loadings <- function(C_est, R) {
+  # Se fatores foram rotacionados por R (F_est %*% R), para manter X ≈ F C',
+  # os loadings devem receber R' (transposta de R).
+  C_est %*% t(R)
+}
+
+# Helper: tenta extrair fatores e loadings (médias) e draws do objeto do bdfm
+extract_bdfm <- function(fit) {
+  nm <- names(fit)
+  get_first <- function(cands) {
+    for (z in cands) if (z %in% nm) return(fit[[z]])
+    NULL
+  }
+  # Fatores (média / ponto)
+  F_mean <- get_first(c("factors_mean","f_mean","factors","F","Ft","f"))
+  # Loadings (média / ponto)
+  C_mean <- get_first(c("loadings_mean","Lambda","loadings","B","beta","C"))
+  # Draws (arrays/matrizes)
+  F_draws <- get_first(c("factors_draws","f_draws","F_draws","f_samples"))
+  C_draws <- get_first(c("loadings_draws","Lambda_draws","B_draws","beta_draws"))
+  list(F_mean=F_mean, C_mean=C_mean, F_draws=F_draws, C_draws=C_draws)
+}
+
+
+```
+
+**Simulação do DFM.** Vamos gerar um conjunto sintético com $T=100$ períodos, $n=100$ séries e $r=3$ fatores latentes. Cada fator segue um VAR(1) diagonal (AR(1) independentes com persistências 0.8, 0.6 e 0.4), os *loadings* $\Lambda$ são sorteados de $\mathcal N(0,1)$ e adicionamos ruído idiossincrático $\mathcal N(0,0.5\,I_n)$. As séries observadas vêm de $X = F\Lambda^\top + E$. Por fim, padronizamos cada série (z-score) para estabilizar a estimação baseada em covariância.
+
+```{r 1-simulacao, message=FALSE}
+# 1) Simular séries: T=100, n=100, r=3 fatores e loadings ----
+T <- 100; n <- 100; r <- 3
+
+# Dinâmica VAR(1) diagonal para os fatores verdadeiros
+Phi <- diag(c(0.8, 0.6, 0.4), r, r)
+Q  <- diag(1, r)
+F_true <- matrix(0, T, r)
+for (t in 2:T) F_true[t,] <- (Phi %*% F_true[t-1,]) + MASS::mvrnorm(1, mu = rep(0, r), Sigma = Q)
+
+# Loadings verdadeiros (n x r)
+Lambda_true <- matrix(rnorm(n*r, sd = 1), n, r)
+
+# Erro idiossincrático
+R_eps <- diag(0.5, n)
+Eps   <- MASS::mvrnorm(T, mu = rep(0, n), Sigma = R_eps)
+
+# Medição: X = F * Lambda' + Eps  (T x n)
+X <- F_true %*% t(Lambda_true) + Eps
+
+# Padronizar colunas (cada série) p/ métodos baseados em covariância
+X_sc <- scale(X)
+
+```
+
+# Plot das séries simuladas.
+
+```{r 2-plot-series, fig.height=4.5}
+# 2) Plot: todas as séries (padronizadas) juntas ----
+matplot(X_sc, type = "l", lty = 1, col = gray(0, alpha = 0.25),
+        main = "Séries simuladas (padronizadas)", ylab = "z-score", xlab = "tempo")
+grid()
+
+```
+
+# Plot dos fatores simulados
+
+```{r 3-plot-fatores, fig.height=6}
+# 3) Plot: fatores verdadeiros (3 subplots) ----
+op <- par(mfrow = c(3,1), mar = c(3,4,2,1))
+for (j in 1:r) {
+  plot(F_true[,j], type = "l", main = paste("Fator verdadeiro", j), xlab = "tempo", ylab = "valor")
+  grid()
+}
+par(op)
+
+```
+
+**Estimativa Bayesiana do DFM.** Aplicamos um **Modelo de Fatores Dinâmicos** em forma de espaço de estado aos dados padronizados $X\in\mathbb{R}^{T\times n}$, com $r$ fatores e $p$ defasagens:
+
+$$
+X_t \;=\; \Lambda{f_t} \;+\;e_t, 
+\qquad e_t \sim \mathcal N(0, R).
+$$
+
+$$
+f_t \;=\; A_1 f_{t-1} + \cdots + A_p f_{t-p} + u_t, 
+\qquad u_t \sim \mathcal N(0, Q).
+$$
+
+Escolhemos $r=3$ e $p=1$ (AR(1) nos fatores). O **`bdfm::dfm()`** estima $(\Lambda, A_{1:p}, Q, R, \{f_t\})$ **via MCMC** (argumentos `reps` = número de iterações e `burn` = descarte inicial).
+
+Após a estimação, extraímos:
+
+-   $\hat F = ( \hat f_1,\ldots,\hat f_T )^\top$ — **média posterior** dos fatores (`F_hat <- factors(fit)`),
+-   $\hat\Lambda$ — **média posterior** dos *loadings* (`C_hat`),
+
+Esses objetos alimentam os passos seguintes (alinhamento/rotação, reescala, comparação com os valores verdadeiros e previsão).
+
+```{r 4-estimacao-bdfm, message=TRUE, warning=FALSE}
+# Defina o número de fatores e de defasagens
+r <- 3
+p <- 1
+
+# GARANTIR nomes (evita bug do summary.dfm)
+if (is.null(colnames(X_sc))) colnames(X_sc) <- paste0("y", seq_len(ncol(X_sc)))
+if (is.null(rownames(X_sc))) rownames(X_sc) <- paste0("t", seq_len(nrow(X_sc)))
+
+# (Opcional mas recomendado) usar objeto ts
+X_sc_ts <- if (inherits(X_sc, "ts")) X_sc else ts(X_sc, start = 1, frequency = 1)
+
+# Estimação Bayesiana
+fit <- bdfm::dfm(
+  data    = X_sc_ts,   # T x n
+  factors = r,
+  lags    = p,
+  method  = "bayesian",
+  scale   = FALSE,
+  reps    = 4000,
+  burn    = 1000,
+  verbose = TRUE
+)
+
+# Resumo seguro (não derruba o knit se a S3 tiver problema)
+s <- tryCatch(summary(fit),
+              error = function(e) {
+                message("Resumo não gerado (summary.dfm falhou): ", e$message)
+                NULL
+              })
+if (!is.null(s)) print(s)
+
+# --- Extrair fatores e loadings ---
+F_hat <- as.matrix(bdfm::factors(fit))  # T x r
+
+nm <- names(fit)
+if ("loadings" %in% nm) {
+  C_hat <- as.matrix(fit$loadings)
+} else if ("H" %in% nm) {
+  C_hat <- as.matrix(fit$H)
+} else if ("loadings_mean" %in% nm) {
+  C_hat <- as.matrix(fit$loadings_mean)
+} else {
+  stop("Não encontrei os loadings no objeto do bdfm. Veja names(fit) e ajuste.")
+}
+
+# Sanity checks
+T <- nrow(F_hat)
+stopifnot(ncol(F_hat) == r, ncol(C_hat) == r)
+
+```
+
+# Comparação dos fatores "reais"(simulados) e estimados
+
+```{r 5-fatores-bdfm-align-scale-IC, message=TRUE, warning=FALSE, fig.height=7}
+# 5) Fatores: alinhar, ajustar sinal+escala e (se houver draws) plotar IC bayesiano ----
+
+# --- Guards: garantir F_hat e F_true ---
+if (!exists("F_hat", inherits = TRUE)) {
+  if (exists("fit", inherits = TRUE)) {
+    F_hat <- as.matrix(bdfm::factors(fit))   # T x r
+    message("F_hat extraído de 'fit' via bdfm::factors().")
+  } else {
+    stop("F_hat não encontrado e 'fit' ausente. Rode o passo de estimação (bdfm::dfm).")
+  }
+}
+if (!exists("F_true", inherits = TRUE)) {
+  if (exists("F", inherits = TRUE) &&
+      is.matrix(F) && all(dim(F) == dim(F_hat))) {
+    F_true <- F
+    message("Usando objeto 'F' como F_true (mesmas dimensões de F_hat).")
+  } else {
+    stop("F_true não encontrado. Rode a simulação (passo 1) para definir F_true.")
+  }
+}
+
+T <- nrow(F_hat); r <- ncol(F_hat)
+
+# --- 0) Tentar extrair F_draws (para IC), se existirem ---
+if (!exists("F_draws", inherits = TRUE)) F_draws <- NULL
+if (is.null(F_draws) && exists("fit", inherits = TRUE)) {
+  nm <- names(fit)
+  for (cand in c("Fstore","factors_draws","f_draws","F_draws","f_samples",
+                 "draws_factors","Fsample","F_samples")) {
+    if (cand %in% nm) { F_draws <- fit[[cand]]; break }
+  }
+  if (is.null(F_draws) && "draws" %in% nm && is.list(fit$draws) && "factors" %in% names(fit$draws)) {
+    F_draws <- fit$draws$factors
+  }
+}
+
+# Normalizar F_draws para T x r x ndraws (se existir)
+normalize_Fdraws <- function(A, T, r){
+  if (is.null(A)) return(NULL)
+  if (length(dim(A)) != 3) return(NULL)
+  d <- dim(A)
+  if (d[1]==T && d[2]==r) return(A)
+  if (d[1]==r && d[2]==T) return(aperm(A, c(2,1,3)))  # r x T x nd -> T x r x nd
+  if (d[1]==T && d[3]==r) return(aperm(A, c(1,3,2)))  # T x nd x r -> T x r x nd
+  if (d[2]==r && d[3]==T) return(aperm(A, c(3,2,1)))  # nd x r x T -> T x r x nd
+  message("Dimensões de F_draws não reconhecidas: ", paste(d, collapse="x"), ". Prosseguindo sem IC.")
+  NULL
+}
+F_draws <- normalize_Fdraws(F_draws, T, r)
+has_draws <- !is.null(F_draws)
+
+# --- 5.1) Alinhamento (Procrustes) com os verdadeiros ---
+al   <- align_factors(F_hat, F_true)
+F_al <- al$F_est_rot
+Rrot <- al$R
+
+# Ajuste de sinais para maximizar correlação por coluna
+for (j in 1:r) if (cor(F_al[, j], F_true[, j]) < 0) F_al[, j] <- -F_al[, j]
+
+# --- 5.2) Reescala (LS por coluna) para aproximar F_al -> F_true ---
+scales <- sapply(1:r, function(j){
+  num <- sum(F_al[, j] * F_true[, j], na.rm = TRUE)
+  den <- sum(F_al[, j]^2,              na.rm = TRUE)
+  s <- if (den > 0) num/den else 1
+  if (!is.finite(s) || s == 0) 1 else s
+})
+F_al_sc <- sweep(F_al, 2, scales, "*")  # T x r
+
+# --- 5.3) IC 95% dos fatores (se tivermos draws) ---
+F_low  <- matrix(NA_real_, T, r)
+F_high <- matrix(NA_real_, T, r)
+
+if (has_draws) {
+  Sdiag <- diag(scales, r)
+  for (t in 1:T) {
+    # nd x r: fatores simulados no tempo t
+    Ft_draws <- t(F_draws[t, , ])    # (r x nd) -> nd x r
+    Ft_rot   <- Ft_draws %*% Rrot    # mesma rotação do alinhamento
+    Ft_fin   <- Ft_rot %*% Sdiag     # mesma reescala
+    F_low[t, ]  <- apply(Ft_fin, 2, quantile, probs = 0.025, na.rm = TRUE)
+    F_high[t, ] <- apply(Ft_fin, 2, quantile, probs = 0.975, na.rm = TRUE)
+  }
+} else {
+  message("Sem draws de fatores disponíveis; o plot seguirá sem banda de IC.")
+}
+
+# --- 5.4) Plot: verdadeiro, estimado e IC (se houver) ---
+op <- par(mfrow = c(3,1), mar = c(3,4,2,1))
+for (j in 1:r) {
+  plot(F_true[, j], type = "l",
+       main = sprintf("Fator %d: verdadeiro vs. bdfm (alinhado + reescalado)", j),
+       xlab = "tempo", ylab = "valor")
+  if (all(is.finite(F_low[, j])) && all(is.finite(F_high[, j]))) {
+    polygon(c(1:T, T:1), c(F_low[, j], rev(F_high[, j])),
+            col = rgb(0, 0, 0, 0.15), border = NA)
+  }
+  lines(F_al_sc[, j], lty = 2, col = "blue", lwd = 1.5)
+  grid()
+  leg <- c("Verdadeiro", "Estimado (bdfm)")
+  if (all(is.finite(F_low[, j])) && all(is.finite(F_high[, j]))) leg <- c(leg, "IC 95% (MCMC)")
+  legend("topleft", leg,
+         lty = c(1,2,1)[seq_along(leg)],
+         lwd = c(1,1.5,6)[seq_along(leg)],
+         col = c("black","blue", rgb(0,0,0,0.15))[seq_along(leg)],
+         bty = "n", seg.len = 2, pt.cex = 0.8)
+}
+par(op)
+
+# --- 5.5) Métricas rápidas ---
+corrs <- sapply(1:r, function(j) cor(F_true[, j], F_al_sc[, j]))
+corrs
+
+```
+
+# Loadings (comparação). Comparamos os loadings estimados aos verdadeiros
+
+```         
+```
+
+```{r 6-compare-loadings-bayes, fig.height=6, message=TRUE, warning=FALSE}
+# 6) Loadings: alinhar e comparar (verdadeiro vs. bdfm) + IC 95% ------------------------
+
+# --- Guards: garantir C_hat ---
+if (!exists("C_hat", inherits = TRUE)) {
+  if (!exists("fit", inherits = TRUE)) stop("C_hat ausente e 'fit' não encontrado. Rode o passo 4.")
+  nm <- names(fit)
+  if ("loadings" %in% nm) {
+    C_hat <- as.matrix(fit$loadings)
+  } else if ("H" %in% nm) {
+    C_hat <- as.matrix(fit$H)
+  } else if ("loadings_mean" %in% nm) {
+    C_hat <- as.matrix(fit$loadings_mean)
+  } else {
+    stop("Não encontrei loadings no objeto 'fit'. Verifique names(fit).")
+  }
+  message("C_hat extraído do objeto 'fit'.")
+}
+
+# --- Guards extra: caso Rrot/scales/F_al_sc não existam, recalcula a partir de F_hat/F_true ---
+if (!exists("Rrot", inherits = TRUE) || !exists("scales", inherits = TRUE) || !exists("F_al_sc", inherits = TRUE)) {
+  if (!exists("F_hat", inherits = TRUE)) {
+    if (!exists("fit", inherits = TRUE)) stop("F_hat/Rrot/scales ausentes e 'fit' não encontrado.")
+    F_hat <- as.matrix(bdfm::factors(fit))
+    message("F_hat extraído via bdfm::factors(fit).")
+  }
+  if (!exists("F_true", inherits = TRUE)) {
+    if (exists("F", inherits = TRUE) && all(dim(F) == dim(F_hat))) {
+      F_true <- F
+      message("Usando objeto 'F' como F_true.")
+    } else stop("F_true ausente. Rode a simulação (passo 1).")
+  }
+  # Alinhamento, sinal e reescala (mesmos passos do bloco 5)
+  al   <- align_factors(F_hat, F_true)
+  F_al <- al$F_est_rot; Rrot <- al$R
+  r <- ncol(F_al)
+  for (j in 1:r) if (cor(F_al[, j], F_true[, j]) < 0) F_al[, j] <- -F_al[, j]
+  scales <- sapply(1:r, function(j){
+    num <- sum(F_al[, j] * F_true[, j], na.rm = TRUE)
+    den <- sum(F_al[, j]^2,              na.rm = TRUE)
+    s <- if (den > 0) num/den else 1
+    if (!is.finite(s) || s == 0) 1 else s
+  })
+  F_al_sc <- sweep(F_al, 2, scales, "*")
+  message("Rrot/scales/F_al_sc recalculados para consistência.")
+}
+
+stopifnot(exists("Lambda_true"))
+n <- nrow(C_hat); r <- ncol(C_hat)
+
+# --- 1) Alinhar, ajustar sinais e reescalar (compatível com fatores) ---
+C_al   <- align_loadings(C_hat, Rrot)   # n x r
+sgn <- sapply(1:r, function(j){
+  s <- sign(cor(C_al[, j], Lambda_true[, j])); if (is.na(s) || s == 0) 1 else s
+})
+for (j in 1:r) C_al[, j] <- sgn[j] * C_al[, j]
+C_al_sc <- sweep(C_al, 2, scales, "/") # inverso da escala aplicada em F
+
+# --- 2) Normalização opcional: Var(F_j) = 1 e compensação em C ---
+sdsF <- apply(F_al_sc, 2, sd); sdsF[!is.finite(sdsF) | sdsF == 0] <- 1
+C_unit <- sweep(C_al_sc, 2, sdsF, "*") # loadings na convenção Var(F)=1
+
+# --- 3) Tentar obter draws dos loadings (Hstore) para IC ---
+normalize_Hstore <- function(Hs, n, r) {
+  if (is.null(Hs)) return(NULL)
+  if (is.list(Hs)) {
+    nd <- length(Hs); if (nd == 0) return(NULL)
+    M1 <- Hs[[1]]; stopifnot(is.matrix(M1))
+    arr <- array(NA_real_, c(n, r, nd))
+    if (nrow(M1) == n && ncol(M1) == r) {
+      for (k in seq_len(nd)) arr[,,k] <- Hs[[k]]
+    } else if (nrow(M1) == r && ncol(M1) == n) {
+      for (k in seq_len(nd)) arr[,,k] <- t(Hs[[k]])
+    } else stop("Dimensões inesperadas em Hstore (esperado n×r ou r×n por draw).")
+    return(arr)
+  }
+  if (is.array(Hs) && length(dim(Hs)) == 3) {
+    d <- dim(Hs)
+    if (all(d[1:2] == c(n, r))) return(Hs)
+    if (all(d[1:2] == c(r, n)))  return(aperm(Hs, c(2,1,3)))
+    if (all(d[2:3] == c(n, r)))  return(aperm(Hs, c(2,3,1)))
+    if (all(d[2:3] == c(r, n)))  return(aperm(Hs, c(3,2,1)))
+    stop("Hstore 3D com dimensões não reconhecidas: ", paste(d, collapse="x"))
+  }
+  stop("Tipo de Hstore não reconhecido (nem lista, nem array 3D).")
+}
+
+C_draws <- NULL
+if (exists("fit", inherits = TRUE) && "Hstore" %in% names(fit)) {
+  C_draws <- normalize_Hstore(fit$Hstore, n = n, r = r)  # n x r x ndraws (pós-burn-in)
+  if (!is.null(C_draws)) message("C_draws extraído de Hstore. ndraws = ", dim(C_draws)[3])
+}
+
+# --- 4) Construir IC 95% nos loadings (aplicando rotação/sinal/escala/normalização em cada draw) ---
+C_low  <- matrix(NA_real_, n, r)
+C_high <- matrix(NA_real_, n, r)
+if (!is.null(C_draws)) {
+  nd <- dim(C_draws)[3]
+  store <- array(NA_real_, c(n, r, nd))
+  for (k in 1:nd) {
+    Ck <- C_draws[,,k]                # n x r
+    Ck_al <- Ck %*% t(Rrot)           # rotação igual
+    for (j in 1:r) Ck_al[, j] <- sgn[j] * Ck_al[, j]      # mesmos sinais
+    Ck_al_sc <- sweep(Ck_al, 2, scales, "/")              # mesma reescala
+    Ck_unit  <- sweep(Ck_al_sc, 2, sdsF, "*")             # Var(F)=1
+    store[,,k] <- Ck_unit
+  }
+  for (j in 1:r) {
+    C_low[, j]  <- apply(store[, j, ], 1, quantile, probs = 0.025, na.rm = TRUE)
+    C_high[, j] <- apply(store[, j, ], 1, quantile, probs = 0.975, na.rm = TRUE)
+  }
+} else {
+  message("Sem Hstore/draws de loadings; plot seguirá sem bandas de IC.")
+}
+
+# --- 5) q-plot (com IC verticais se disponíveis) ---
+op <- par(mfrow = c(1,3), mar = c(4,4,2,1))
+for (j in 1:r) {
+  x <- Lambda_true[, j]
+  y <- C_unit[, j]
+  plot(x, y, pch = 19, cex = 0.7,
+       xlab = "Loading verdadeiro", ylab = "Loading (bdfm, Var(F)=1)",
+       main = paste("Fator", j))
+  abline(0, 1, col = "red", lwd = 2)
+  if (all(is.finite(C_low[, j])) && all(is.finite(C_high[, j]))) {
+    segments(x0 = x, y0 = C_low[, j], x1 = x, y1 = C_high[, j],
+             col = rgb(0,0,0,0.25), lwd = 1)
+  }
+  grid()
+}
+par(op)
+
+```
+
+```{r 7-fit-reconstrucao-bayes, fig.height=6}
+# 7) Fit das 5 primeiras séries reconstruídas ----
+# Reconstrução coerente com as escalas: Xhat = F_al_sc %*% t(C_al_sc)
+Xhat <- F_al_sc %*% t(C_al_sc)
+
+col_real <- "black"
+col_fit  <- "#D55E00"  # laranja (bom contraste)
+
+op <- par(mfrow = c(5,1), mar = c(3,4,1.5,1))
+for (i in 1:5) {
+  plot(X_sc[, i], type = "l", col = col_real, lwd = 1.2,
+       main = paste("Série", i, ": real vs. reconstruída (bdfm)"),
+       xlab = "tempo", ylab = "z-score")
+  lines(Xhat[, i], lty = 2, col = col_fit, lwd = 2)
+  grid()
+  legend("topleft", c("Real", "Fit"),
+         col = c(col_real, col_fit), lty = c(1,2), lwd = c(1.2, 2), bty = "n")
+}
+par(op)
+```
+
+```{r 8-forecast-fatores-bayes, fig.height=6, message=FALSE, warning=FALSE}
+# 8) Previsão (forecast) dos fatores e plot ----
+# Como a API de previsão do 'bdfm' varia, aqui usamos um proxy: VAR(p) nos fatores estimados.
+# (Se sua versão do bdfm tiver predict(), substitua por ela.)
+h <- 12
+p_var <- 1  # use mesmo p do estado, se quiser
+
+# Ajuste VAR nos fatores reescalados
+df_fac <- as.data.frame(F_al_sc)
+colnames(df_fac) <- paste0("F", 1:r)
+fit_var <- vars::VAR(df_fac, p = p_var, type = "const")
+
+fc <- predict(fit_var, n.ahead = h)
+# Extrair trajetória prevista (média) por fator
+F_fore <- sapply(1:r, function(j) fc$fcst[[j]][, "fcst"])
+F_fore <- matrix(F_fore, nrow = h, ncol = r)  # h x r
+
+# Plot: estimado (azul) + previsão (vermelho)
+op <- par(mfrow = c(3,1), mar = c(3,4,2,1))
+for (j in 1:r) {
+  ts_all <- c(F_al_sc[, j], F_fore[, j])
+  plot(ts_all, type = "l", col = "blue",
+       main = paste0("Fator ", j, ": estimado + previsão (", h, " passos)"),
+       xlab = "tempo", ylab = "valor")
+  abline(v = T, lty = 3)
+  lines((T+1):(T+h), F_fore[, j], col = "red", lty = 2, lwd = 2)
+  grid(); legend("topleft", c("Estimado", "Previsão"),
+                 col = c("blue", "red"), lty = c(1,2), lwd = 2, bty = "n")
+}
+par(op)
+
+```
+
+```{r 9-reconstrucao-forecast-bayes, fig.height=6}
+# 9) Reconstruir séries "previstas" a partir dos fatores previstos ----
+# Mantendo coerência de escala: X_fore = F_fore %*% t(C_al_sc)
+X_fore <- F_fore %*% t(C_al_sc)
+
+# Plot das 5 primeiras séries: histórico + previsão
+op <- par(mfrow = c(5,1), mar = c(3,4,1.5,1))
+for (i in 1:5) {
+  series_all <- c(X_sc[, i], X_fore[, i])
+  plot(series_all, type = "l",
+       main = paste("Série", i, ": histórico + previsão (bdfm+AR)"),
+       xlab = "tempo", ylab = "z-score")
+  abline(v = T, lty = 3)
+  lines((T+1):(T+nrow(X_fore)), X_fore[, i], lty = 2, col = "red")
+  grid(); legend("topleft", c("Histórico", "Previsto"),
+                 col = c("black","red"), lty = c(1,2), bty = "n")
+}
+par(op)
+```
